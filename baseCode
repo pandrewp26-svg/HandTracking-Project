@@ -1,0 +1,346 @@
+
+import csv
+import json
+import time
+from pathlib import Path
+from collections import deque
+
+import cv2
+import mediapipe as mp
+import numpy as np
+import matplotlib.pyplot as plt
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+
+
+# -------------------- Settings --------------------
+
+MODEL = Path(__file__).parent / "hand_landmarker.task"
+OUTPUT = Path(__file__).parent / "hand_tracker_data"
+TRIAL_GAP = 2.0
+HISTORY_SIZE = 300
+
+FINGERS = {
+    "Thumb": (2, 3, 4),
+    "Index": (5, 6, 7),
+    "Middle": (9, 10, 11),
+    "Ring": (13, 14, 15),
+    "Pinky": (17, 18, 19),
+}
+
+CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    (9, 13), (13, 14), (14, 15), (15, 16),
+    (13, 17), (17, 18), (18, 19), (19, 20), (0, 17),
+]
+
+AXES = ("x", "y", "z")
+
+
+# -------------------- Measurements --------------------
+
+def bend_angle(points, a, b, c):
+    """2D joint bend: 0 degrees means straight."""
+    v1, v2 = points[a] - points[b], points[c] - points[b]
+    denominator = np.linalg.norm(v1) * np.linalg.norm(v2)
+
+    if denominator < 1e-8:
+        return None
+
+    cosine = np.clip(np.dot(v1, v2) / denominator, -1, 1)
+    return 180 - np.degrees(np.arccos(cosine))
+
+
+def palm_orientation(points):
+    """2D wrist-to-middle-MCP direction."""
+    v = points[9] - points[0]
+    return np.degrees(np.arctan2(v[1], v[0]))
+
+
+def palm_normal(points):
+    """Approximate 3D normal from wrist, index MCP, and pinky MCP."""
+    wrist = points[0]
+    normal = np.cross(points[5] - wrist, points[17] - wrist)
+    length = np.linalg.norm(normal)
+    return normal / length if length > 1e-8 else None
+
+
+# -------------------- Kalman filter --------------------
+
+class AngleFilter:
+    """Constant-velocity Kalman filter for an angle."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.x = None
+        self.P = np.diag([100.0, 400.0])
+        self.last_time = None
+
+    def update(self, angle, now):
+        if self.x is None:
+            self.x = np.array([angle, 0.0])
+            self.last_time = now
+            return angle
+
+        dt = np.clip(now - self.last_time, 0.001, 0.25)
+        self.last_time = now
+
+        F = np.array([[1, dt], [0, 1]], dtype=float)
+        Q = 0.8 * np.array([
+            [dt**4 / 4, dt**3 / 2],
+            [dt**3 / 2, dt**2],
+        ])
+
+        self.x = F @ self.x
+        self.P = F @ self.P @ F.T + Q
+
+        H = np.array([[1.0, 0.0]])
+        R = np.array([[4.0]])
+        innovation = np.array([angle]) - H @ self.x
+        S = H @ self.P @ H.T + R
+        K = self.P @ H.T @ np.linalg.inv(S)
+
+        self.x += (K @ innovation).ravel()
+        self.P = (np.eye(2) - K @ H) @ self.P
+        return float(self.x[0])
+
+
+# -------------------- Setup --------------------
+
+if not MODEL.exists():
+    raise FileNotFoundError(f"Missing model file: {MODEL}")
+
+OUTPUT.mkdir(exist_ok=True)
+(OUTPUT / "plots").mkdir(exist_ok=True)
+
+sessions = [
+    int(p.stem.split("_")[1])
+    for p in OUTPUT.glob("session_*.csv")
+    if len(p.stem.split("_")) > 1 and p.stem.split("_")[1].isdigit()
+]
+session = max(sessions, default=0) + 1
+stamp = time.strftime("%Y%m%d_%H%M%S")
+
+csv_path = OUTPUT / f"session_{session:03d}_{stamp}.csv"
+plot_dir = OUTPUT / "plots"
+
+options = vision.HandLandmarkerOptions(
+    base_options=python.BaseOptions(model_asset_path=str(MODEL)),
+    running_mode=vision.RunningMode.VIDEO,
+    num_hands=1,
+)
+
+filters = {name: AngleFilter() for name in FINGERS}
+normal_filters = {axis: AngleFilter() for axis in AXES}
+bend_history = deque(maxlen=HISTORY_SIZE)
+normal_history = deque(maxlen=HISTORY_SIZE)
+
+fields = [
+    "timestamp", "elapsed_s", "frame", "trial", "hand_detected",
+    "hand_absent_s", "palm_orientation_2d_deg", "landmarks_2d_json",
+]
+for axis in AXES:
+    fields += [
+        f"palm_normal_{axis}",
+        f"palm_normal_{axis}_angle_raw_deg",
+        f"palm_normal_{axis}_angle_filtered_deg",
+    ]
+for name in FINGERS:
+    fields += [f"{name.lower()}_raw_deg", f"{name.lower()}_filtered_deg"]
+
+
+# -------------------- Plotting --------------------
+
+def save_plots():
+    plots = [
+        (bend_history, ["Raw", "Filtered"],
+         ["Index bend (degrees)", "Raw vs Filtered 2D Index Bend"],
+         ["#1", "#2"]),
+        (normal_history, [f"{a.upper()} angle" for a in AXES],
+         ["Angle to positive axis (degrees)", "Approximate Palm-Normal Axis Angles"],
+         ["#1", "#2", "#3"]),
+    ]
+
+    for history, labels, text, _ in plots:
+        if not history:
+            continue
+
+        data = np.array(history)
+        plt.figure(figsize=(10, 4 if len(labels) == 2 else 5))
+
+        for i, label in enumerate(labels, start=1):
+            plt.plot(data[:, 0], data[:, i], label=label)
+
+        plt.xlabel("Frame")
+        plt.ylabel(text[0])
+        plt.title(text[1])
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+
+        suffix = "bend" if len(labels) == 2 else "normal"
+        path = plot_dir / f"session_{session:03d}_{stamp}_{suffix}.png"
+        plt.savefig(path, dpi=150)
+        plt.close()
+
+
+# -------------------- Tracking and logging --------------------
+
+camera = cv2.VideoCapture(0)
+if not camera.isOpened():
+    raise RuntimeError("Could not open webcam. Try camera index 1.")
+
+start = time.monotonic()
+last_hand_time = None
+frame_number = trial = 0
+last_timestamp_ms = -1
+
+try:
+    with vision.HandLandmarker.create_from_options(options) as tracker:
+        with csv_path.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=fields)
+            writer.writeheader()
+
+            while True:
+                ok, frame = camera.read()
+                if not ok:
+                    break
+
+                now = time.monotonic()
+                elapsed = now - start
+                frame_number += 1
+                timestamp_ms = max(last_timestamp_ms + 1, int(elapsed * 1000))
+                last_timestamp_ms = timestamp_ms
+
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                result = tracker.detect_for_video(image, timestamp_ms)
+
+                detected = bool(result.hand_landmarks)
+                row = {field: "" for field in fields}
+                row.update({
+                    "timestamp": time.time(),
+                    "elapsed_s": round(elapsed, 4),
+                    "frame": frame_number,
+                    "trial": trial,
+                    "hand_detected": int(detected),
+                })
+
+                if detected:
+                    landmarks = result.hand_landmarks[0]
+                    height, width = frame.shape[:2]
+
+                    points_2d = np.array([
+                        [lm.x * width, lm.y * height] for lm in landmarks
+                    ])
+                    # MediaPipe z is relative depth, not calibrated distance.
+                    points_3d = np.array([
+                        [lm.x * width, lm.y * height, lm.z * width]
+                        for lm in landmarks
+                    ])
+
+                    if last_hand_time is None or now - last_hand_time > TRIAL_GAP:
+                        trial += 1
+                        row["trial"] = trial
+                        for f in (*filters.values(), *normal_filters.values()):
+                            f.reset()
+                        print(f"Trial {trial} started")
+
+                    last_hand_time = now
+                    row["hand_absent_s"] = 0
+                    row["landmarks_2d_json"] = json.dumps(
+                        np.round(points_2d, 2).tolist()
+                    )
+                    row["palm_orientation_2d_deg"] = round(
+                        float(palm_orientation(points_2d)), 2
+                    )
+
+                    normal = palm_normal(points_3d)
+                    if normal is not None:
+                        axis_angles = np.degrees(
+                            np.arccos(np.clip(normal, -1, 1))
+                        )
+                        filtered_angles = []
+
+                        for axis, component, angle in zip(AXES, normal, axis_angles):
+                            filtered = normal_filters[axis].update(float(angle), now)
+                            row[f"palm_normal_{axis}"] = round(float(component), 5)
+                            row[f"palm_normal_{axis}_angle_raw_deg"] = round(float(angle), 2)
+                            row[f"palm_normal_{axis}_angle_filtered_deg"] = round(filtered, 2)
+                            filtered_angles.append(filtered)
+
+                        normal_history.append([frame_number, *filtered_angles])
+
+                        cv2.putText(
+                            frame,
+                            f"Normal X:{normal[0]:.2f} Y:{normal[1]:.2f} Z:{normal[2]:.2f}",
+                            (15, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                            (255, 255, 255), 2,
+                        )
+
+                    for a, b in CONNECTIONS:
+                        cv2.line(
+                            frame,
+                            tuple(points_2d[a].astype(int)),
+                            tuple(points_2d[b].astype(int)),
+                            (0, 220, 0), 2,
+                        )
+
+                    for name, (a, b, c) in FINGERS.items():
+                        raw = bend_angle(points_2d, a, b, c)
+                        if raw is None:
+                            continue
+
+                        filtered = filters[name].update(raw, now)
+                        row[f"{name.lower()}_raw_deg"] = round(raw, 2)
+                        row[f"{name.lower()}_filtered_deg"] = round(filtered, 2)
+
+                        if name == "Index":
+                            bend_history.append([frame_number, raw, filtered])
+                            for y, label, value in [
+                                (30, "Raw", raw), (60, "Filtered", filtered)
+                            ]:
+                                cv2.putText(
+                                    frame, f"Index {label}: {value:.1f} deg",
+                                    (15, y), cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.7, (255, 255, 255), 2,
+                                )
+
+                elif last_hand_time is not None:
+                    absent = now - last_hand_time
+                    row["hand_absent_s"] = round(absent, 3)
+                    if absent > TRIAL_GAP:
+                        last_hand_time = None
+
+                writer.writerow(row)
+                file.flush()
+
+                cv2.putText(
+                    frame, f"Trial: {trial} | Frame: {frame_number}",
+                    (15, frame.shape[0] - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2,
+                )
+                cv2.imshow("Hand Tracker", frame)
+
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord("q"), 27):
+                    break
+                if key == ord("r"):
+                    for f in (*filters.values(), *normal_filters.values()):
+                        f.reset()
+                    print("Filters reset.")
+                elif key == ord("p"):
+                    save_plots()
+                    print(f"Plots saved in {plot_dir}")
+
+finally:
+    camera.release()
+    cv2.destroyAllWindows()
+
+save_plots()
+print(f"CSV saved: {csv_path}")
+print(f"Plots saved in: {plot_dir}")
